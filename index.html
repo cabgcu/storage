@@ -859,7 +859,7 @@ function loginView(){
     <div class="form-wrap" style="margin-top:22px">
       <p class="err" id="err"></p>
       <div class="f"><label>Student ID</label>
-        <input id="sid" type="text" inputmode="numeric" autocomplete="off" placeholder="e.g. 123456"></div>
+        <input id="sid" type="text" inputmode="numeric" autocomplete="off" placeholder="e.g. 123456" style="text-align:center;letter-spacing:.06em"></div>
       <button class="go" data-act="signin">Sign in</button>
       <p class="hint">${PEOPLE.length} people on the ${esc(ACTIVE_YEAR || "current")} roster \u00b7 directors, assistant directors and staff get the admin tools</p>
     </div>
@@ -892,7 +892,7 @@ function bar(){
 }
 function nav(){
   const tabs = [["search","⌕","Find"], ["out","↩","Out", outItems().length],
-    ["more","⋯","More", isStaff() ? flagged().length : 0]];
+    ["more","⋯","More", flagged().length]];
   return `<nav class="nav">${tabs.map(t => `
     <button data-page="${t[0]}" aria-current="${S.page === t[0]}">
       <span class="ic">${t[1]}${t[3] ? `<span class="pip">${t[3]}</span>` : ""}</span>
@@ -1004,16 +1004,13 @@ function issuesView(){
 }
 
 function moreView(){
-  const items = isStaff()
-    ? [["list","📋","Full item list","Every item and where it lives"],
-       ["add","＋","Add an item","Put something new on a shelf"],
-       ["audit","✓","Audit a shelf","Walk it, tick what's there"],
-       ["bulk","⇄","Bulk move","Reshelve a lot at once"],
-       ["issues","⚑","Issues",flagged().length + " flagged"],
-       ["sync","⇅","Import / export","Paste the sheet, or take it with you"]]
-    : [["list","📋","Full item list","Every item and where it lives"],
-       ["away","🎒","Put it away","Walk the row in shelf order"],
-       ["sync","⇅","Export","Download the list as a spreadsheet"]];
+  const items = [["list","📋","Full item list","Every item and where it lives"],
+     ["add","＋","Add an item","Put something new on a shelf"],
+     ["away","🎒","Put it away","Walk the row in shelf order"],
+     ["audit","✓","Audit a shelf","Walk it, tick what's there"],
+     ["bulk","⇄","Bulk move","Reshelve a lot at once"],
+     ["issues","⚑","Issues",flagged().length + " flagged"],
+     ["sync","⇅","Import / export","Paste the sheet, or take it with you"]];
   return `<div class="sec-h"><h2>More</h2><span>${esc(S.user.name)} · ${esc(S.user.team || "")}${S.user.position && S.user.position !== "Team Member" ? " · " + esc(S.user.position) : ""}</span></div>
     <div class="menu">${items.map(m => `<button data-page="${m[0]}">
       <span class="mi">${m[1]}</span><span class="mt"><b>${m[2]}</b><small>${esc(m[3])}</small></span><span class="ma">›</span>
