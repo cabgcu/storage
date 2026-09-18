@@ -51,3 +51,34 @@ create policy "public delete" on public.items for delete using (true);
 
 -- Realtime: broadcast inserts/updates/deletes so every open tab stays in sync
 alter publication supabase_realtime add table public.items;
+
+-- App configuration (shelving units, shelf count, custom shelf names,
+-- categories, issue-flag types) — admins edit this from the "Manage" page
+-- and it syncs live to everyone, the same way items do. A single row
+-- (id = 'app') holds the whole config blob.
+create table if not exists public.config (
+  id text primary key,
+  value jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
+
+drop trigger if exists config_set_updated_at on public.config;
+create trigger config_set_updated_at
+  before update on public.config
+  for each row execute function public.set_updated_at();
+
+alter table public.config enable row level security;
+
+drop policy if exists "public read" on public.config;
+create policy "public read" on public.config for select using (true);
+
+drop policy if exists "public insert" on public.config;
+create policy "public insert" on public.config for insert with check (true);
+
+drop policy if exists "public update" on public.config;
+create policy "public update" on public.config for update using (true);
+
+drop policy if exists "public delete" on public.config;
+create policy "public delete" on public.config for delete using (true);
+
+alter publication supabase_realtime add table public.config;
