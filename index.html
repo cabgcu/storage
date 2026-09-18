@@ -350,6 +350,12 @@ select{appearance:none;-webkit-appearance:none;background-image:
   background-size:6px 6px,6px 6px;background-repeat:no-repeat;padding-right:36px!important}
 select option{background:#15151A;color:#fff}
 
+/* Manage page — compact editable rows (input + Save + Remove/Retire) */
+.mgrow{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+.mgrow input{flex:1;min-width:0;width:auto}
+.mgrow .mini{flex:0 0 auto;min-width:64px;min-height:40px}
+.panel .mgrow input{padding:11px 13px}
+
 </style>
 </head>
 <body>
@@ -378,15 +384,34 @@ const STAFF = [
   { id: "STAFF-05", name: "Dylan Haugan", team: "Staff", position: "Admin" }
 ];
 
-const CATS = ["Christmas / Winter","Halloween / Haunted House","Fall / Thanksgiving","Easter / Spring",
+/* Categories, shelving units/shelves and issue-flag types are all
+   admin-customizable from the "Manage" page (see manageView() below) and
+   sync live via the `config` Supabase table — these are just the
+   defaults a brand-new database starts from.
+   Category NAMES can be renamed or retired in place, but the array
+   position is each category's permanent id (it's what item.cat stores),
+   so admins can't reorder or truly delete one — only rename or retire it —
+   or every item pointing at that index would silently change category. */
+let CATS = ["Christmas / Winter","Halloween / Haunted House","Fall / Thanksgiving","Easter / Spring",
 "Tropical / Summer / Beach","USA / Country / Western","Neon / Glow / Party","Circus / Carnival / Fair",
 "Nerf / Games / Sports","Disney / Movie / Character","Lighting / Electronics","AV / Production Equipment",
 "Furniture / Event Setup / Backdrops","Kitchen / Food / Serving","Craft / Art / Supplies",
 "Containers / Storage / Utility","Glass / Vases / Decorative","Decorative / Wall Decor","Costume Props",
 "Theme Decor","Party Supplies","Signs / Decorative","Utility / Maintenance Supplies",
 "Event Setup / VIP Decor","Crowd Control","Miscellaneous"];
-const UNITS = ["A","B","C","D"], SHELVES = [1,2,3,4,5];
-const FLAGS = ["Damaged","Missing","Wrong shelf","Running low"];
+/* retired[i] === true hides category i from pickers for NEW items, without
+   touching existing items already filed under it */
+let CAT_RETIRED = CATS.map(() => false);
+/* unit codes (A, B, C…) are the stable id items store in `unit` — renaming
+   only changes UNIT_NAMES, never the code itself */
+let UNITS = ["A","B","C","D"];
+let UNIT_NAMES = {};
+let SHELF_COUNT = 5;
+function buildShelves(){ return Array.from({ length: SHELF_COUNT }, (_, i) => i + 1); }
+let SHELVES = buildShelves();
+/* optional custom label for one specific shelf, keyed "A-1" */
+let SHELF_NAMES = {};
+let FLAGS = ["Damaged","Missing","Wrong shelf","Running low"];
 
 const CAT_EMOJI = ["\u{1F384}","\u{1F383}","\u{1F342}","\u{1F338}","\u{1F334}","\u{1F920}","\u2728","\u{1F3A1}",
 "\u{1F3AF}","\u{1F3AC}","\u{1F4A1}","\u{1F39B}\uFE0F","\u{1FA91}","\u{1F37D}\uFE0F","\u{1F3A8}","\u{1F4E6}",
@@ -730,11 +755,65 @@ sb.channel("items-sync")
   .subscribe();
 
 /* =======================================================
+   Config sync — units, shelves, categories, flags. Same
+   load/debounce-save/realtime shape as items above.
+   ======================================================= */
+function snapshotConfig(){
+  return { cats: CATS.slice(), catRetired: CAT_RETIRED.slice(), units: UNITS.slice(),
+    unitNames: { ...UNIT_NAMES }, shelfCount: SHELF_COUNT, shelfNames: { ...SHELF_NAMES }, flags: FLAGS.slice() };
+}
+function applyConfig(v){
+  if (!v || typeof v !== "object") return;
+  if (Array.isArray(v.cats) && v.cats.length) CATS = v.cats.slice();
+  CAT_RETIRED = Array.isArray(v.catRetired) ? v.catRetired.slice() : [];
+  while (CAT_RETIRED.length < CATS.length) CAT_RETIRED.push(false);
+  if (Array.isArray(v.units) && v.units.length) UNITS = v.units.slice();
+  UNIT_NAMES = v.unitNames && typeof v.unitNames === "object" ? { ...v.unitNames } : {};
+  if (Number(v.shelfCount) > 0) SHELF_COUNT = Math.floor(Number(v.shelfCount));
+  SHELVES = buildShelves();
+  SHELF_NAMES = v.shelfNames && typeof v.shelfNames === "object" ? { ...v.shelfNames } : {};
+  if (Array.isArray(v.flags) && v.flags.length) FLAGS = v.flags.slice();
+}
+async function loadConfig(){
+  try{
+    const { data, error } = await sb.from("config").select("value").eq("id", "app").maybeSingle();
+    if (error) throw error;
+    if (data && data.value) applyConfig(data.value); else await syncConfig(); // seed the row on first run
+  }catch(e){ console.error("load config failed", e); }
+}
+let cfgTmr = null, cfgRefreshPending = false;
+function saveConfig(){
+  clearTimeout(cfgTmr);
+  cfgTmr = setTimeout(async () => {
+    cfgTmr = null;
+    await syncConfig();
+    if (cfgRefreshPending){ cfgRefreshPending = false; await refreshConfigFromServer(); }
+  }, 200);
+}
+async function syncConfig(){
+  try{ await sb.from("config").upsert({ id: "app", value: snapshotConfig() }); }
+  catch(e){ console.error("sync config failed", e); }
+}
+async function refreshConfigFromServer(){
+  try{
+    const { data } = await sb.from("config").select("value").eq("id", "app").maybeSingle();
+    if (data && data.value) applyConfig(data.value);
+    render();
+  }catch(e){ console.error("refresh config failed", e); }
+}
+sb.channel("config-sync")
+  .on("postgres_changes", { event: "*", schema: "public", table: "config" }, () => {
+    if (cfgTmr){ cfgRefreshPending = true; return; }
+    refreshConfigFromServer();
+  })
+  .subscribe();
+
+/* =======================================================
    State + helpers
    ======================================================= */
 const S = { items: [], user: null, page: "search", q: "",
   browse: null, sheet: null, pick: null, sel: [], audit: null, dest: null,
-  check: null, lq: "", lf: "all", lsort: "shelf" };
+  check: null, lq: "", lf: "all", lsort: "shelf", bq: "" };
 const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
 const isStaff = () => !!(S.user && ADMIN_TITLES.includes(S.user.position));
@@ -744,6 +823,22 @@ const fmtDate = s => s ? new Date(s + "T12:00:00").toLocaleDateString(undefined,
 const byId = id => S.items.find(x => x.id === id);
 const isLate = it => !!(it.out && it.out.at < todayISO());     // due back the night of the event
 const shelfOf = it => (it.unit || "?") + "-" + (it.shelf || "?");
+/* display helpers — the "A-1" style key above stays the stable id used in
+   data attributes and comparisons everywhere; these are only for what a
+   human sees, so admins can rename a unit or a single shelf without
+   touching any stored item */
+const unitLabel = u => (UNIT_NAMES[u] && UNIT_NAMES[u].trim()) || u;
+const shelfKey = (u, s) => u + "-" + s;
+const shelfLabel = (u, s) => {
+  const custom = SHELF_NAMES[shelfKey(u, s)];
+  const base = unitLabel(u) + "-" + s;
+  return custom ? custom + " (" + base + ")" : base;
+};
+const shelfLabelFromKey = k => {
+  if (k === "ALL") return "All shelves";
+  const [u, s] = String(k).split("-");
+  return shelfLabel(u, +s);
+};
 
 function emojiFor(it){
   if (it.emoji) return it.emoji;
@@ -914,8 +1009,8 @@ function card(it){
       </span>
     </div>
     <div class="where">
-      <div><div class="k">Shelving unit</div><div class="v">Shelf ${esc(it.unit || "—")}</div></div>
-      <div><div class="k">Shelf</div><div class="v">${esc(it.shelf || "—")}</div></div>
+      <div><div class="k">Shelving unit</div><div class="v">${it.unit ? esc(unitLabel(it.unit)) : "—"}</div></div>
+      <div><div class="k">Shelf</div><div class="v">${it.unit && it.shelf ? esc(shelfLabel(it.unit, it.shelf)) : esc(it.shelf || "—")}</div></div>
     </div>
     ${it.contents ? `<p class="note"><b>Inside:</b> ${esc(it.contents)}</p>` : ""}
     ${it.notes ? `<p class="note">${esc(it.notes)}</p>` : ""}
@@ -940,7 +1035,7 @@ function card(it){
 /* compact row used by put-away, audit, bulk move */
 function row(it, right){
   return `<div class="row"><span class="rg">${emojiFor(it)}</span>
-    <span class="rt"><b>${esc(it.name)}</b><small>${shelfOf(it)}${it.out ? " · out with " + esc(it.out.by.split(" ")[0]) : ""}</small></span>
+    <span class="rt"><b>${esc(it.name)}</b><small>${esc(shelfLabel(it.unit, it.shelf))}${it.out ? " · out with " + esc(it.out.by.split(" ")[0]) : ""}</small></span>
     ${right || ""}</div>`;
 }
 
@@ -957,7 +1052,7 @@ function searchView(){
       <input id="q" type="search" value="${esc(S.q)}" placeholder="Christmas tree, ping pong balls…" autocomplete="off" autocapitalize="none"></div>
     ${searching ? "" : `
       <p class="chips-label">Browse a shelf</p>
-      <div class="chips">${UNITS.map(u => `<button class="chip" data-browse="shelf:${u}" aria-pressed="${bk === "shelf" && bv === u}">Shelf ${u}</button>`).join("")}</div>
+      <div class="chips">${UNITS.map(u => `<button class="chip" data-browse="shelf:${u}" aria-pressed="${bk === "shelf" && bv === u}">Shelf ${esc(unitLabel(u))}</button>`).join("")}</div>
       <p class="chips-label">Browse a category</p>
       <div class="chips">${usedCats().map(c => `<button class="chip" data-browse="cat:${c}" aria-pressed="${bk === "cat" && +bv === c}">${emojiFor({cat:c,name:""})} ${esc(CATS[c].split(" / ")[0])}</button>`).join("")}</div>`}
     ${searching
@@ -965,7 +1060,7 @@ function searchView(){
          ${hits.length ? `<div class="results">${hits.map(card).join("")}</div>`
            : `<div class="empty"><b>Nothing by that name</b>Try one word instead of two, or browse a shelf above.</div>`}`
       : S.browse
-        ? `<p class="qmeta">${hits.length} item${hits.length === 1 ? "" : "s"} ${bk === "shelf" ? "on Shelf " + bv : "in " + esc(CATS[+bv])}</p>
+        ? `<p class="qmeta">${hits.length} item${hits.length === 1 ? "" : "s"} ${bk === "shelf" ? "on Shelf " + esc(unitLabel(bv)) : "in " + esc(CATS[+bv])}</p>
            <div class="results">${hits.map(card).join("")}</div>`
         : `<div class="empty"><b>${S.items.length} items on file</b>Search a name or what's inside a box — "ping pong" finds the bin it lives in.</div>`}`;
 }
@@ -975,7 +1070,7 @@ function awayView(){
   const groups = byShelf(list);
   return `<div class="sec-h"><h2>Put it away</h2><span>${list.length} item${list.length === 1 ? "" : "s"} · walk the row in order</span></div>
     ${list.length ? groups.map(([sh, l]) => `
-      <div class="grp"><div class="grph"><b>Shelf ${sh}</b><span>${l.length} item${l.length === 1 ? "" : "s"}</span>
+      <div class="grp"><div class="grph"><b>Shelf ${esc(shelfLabelFromKey(sh))}</b><span>${l.length} item${l.length === 1 ? "" : "s"}</span>
         <button class="mini ok" data-inshelf="${sh}">Put all back</button></div>
         ${l.map(i => row(i, `<button class="mini ok" data-in="${i.id}">Done</button>`)).join("")}</div>`).join("")
       : `<div class="empty"><b>All clear</b>Nothing left to put away.</div>`}`;
@@ -1008,9 +1103,10 @@ function moreView(){
      ["add","＋","Add an item","Put something new on a shelf"],
      ["away","🎒","Put it away","Walk the row in shelf order"],
      ["audit","✓","Audit a shelf","Walk it, tick what's there"],
-     ["bulk","⇄","Bulk move","Reshelve a lot at once"],
+     ["bulk","⇄","Bulk edit","Reshelve, recategorize or delete a lot at once"],
      ["issues","⚑","Issues",flagged().length + " flagged"],
      ["sync","⇅","Import / export","Paste the sheet, or take it with you"]];
+  if (isStaff()) items.push(["manage","⚙","Manage","Rename shelves, categories, issue types"]);
   return `<div class="sec-h"><h2>More</h2><span>${esc(S.user.name)} · ${esc(S.user.team || "")}${S.user.position && S.user.position !== "Team Member" ? " · " + esc(S.user.position) : ""}</span></div>
     <div class="menu">${items.map(m => `<button data-page="${m[0]}">
       <span class="mi">${m[1]}</span><span class="mt"><b>${m[2]}</b><small>${esc(m[3])}</small></span><span class="ma">›</span>
@@ -1049,7 +1145,7 @@ function listView(){
     ${checking ? `<div class="prog" style="margin:14px 0 0"><i style="width:${S.items.length ? done / S.items.length * 100 : 0}%"></i></div>` : ""}
     <div class="listwrap" style="margin-top:16px">
       ${groups.length ? groups.map(([sh, l]) => `
-        <div class="grp"><div class="grph"><b>${az ? sh : "Shelf " + sh}</b><span>${l.length} item${l.length === 1 ? "" : "s"}</span></div>
+        <div class="grp"><div class="grph"><b>${az ? esc(sh) : "Shelf " + esc(shelfLabelFromKey(sh))}</b><span>${l.length} item${l.length === 1 ? "" : "s"}</span></div>
           ${l.map(i => listRow(i)).join("")}</div>`).join("")
         : `<div class="empty"><b>Nothing matches</b>Try a different word or clear the filter.</div>`}
     </div>
@@ -1060,7 +1156,7 @@ function listRow(it){
   const mark = S.check ? S.check[it.id] : null, gone = mark === "no";
   return `<div class="lrow ${gone ? "gone" : ""} ${mark === "yes" ? "ok" : ""}">
     <span class="rg">${emojiFor(it)}</span>
-    <span class="rt"><b>${esc(it.name)}</b><small>${shelfOf(it)}${it.contents ? " · " + esc(it.contents.slice(0, 40)) : ""}</small></span>
+    <span class="rt"><b>${esc(it.name)}</b><small>${esc(shelfLabel(it.unit, it.shelf))}${it.contents ? " · " + esc(it.contents.slice(0, 40)) : ""}</small></span>
     ${S.check ? `<span class="marks">
         <button class="mini ok ${mark === "yes" ? "on" : ""}" data-mark2="${it.id}:yes">Here</button>
         <button class="mini no ${gone ? "on" : ""}" data-mark2="${it.id}:no">Nope</button></span>`
@@ -1084,19 +1180,20 @@ function auditView(){
   if (!a) return `<div class="sec-h"><h2>Audit a shelf</h2><span>Tick off what's actually there</span></div>
     <div class="empty" style="margin-top:0"><b>Pick a shelf to walk</b>Twenty shelves, a few minutes each.</div>
     <div class="chips" style="flex-wrap:wrap">${UNITS.flatMap(u => SHELVES.map(s =>
-      `<button class="chip" data-audit="${u}-${s}">${u}-${s} · ${S.items.filter(i => i.unit === u && i.shelf === s).length}</button>`)).join("")}</div>`;
+      `<button class="chip" data-audit="${u}-${s}">${esc(shelfLabel(u, s))} · ${S.items.filter(i => i.unit === u && i.shelf === s).length}</button>`)).join("")}</div>`;
   const list = a.shelf === "ALL" ? S.items.slice() : S.items.filter(i => shelfOf(i) === a.shelf);
   const done = Object.keys(a.marks).length;
+  const aLabel = esc(shelfLabelFromKey(a.shelf));
   if (a.finished){
     const missing = list.filter(i => a.marks[i.id] === "no");
-    return `<div class="sec-h"><h2>Shelf ${a.shelf} audited</h2><span>${list.length} checked · ${missing.length} not found</span></div>
+    return `<div class="sec-h"><h2>Shelf ${aLabel} audited</h2><span>${list.length} checked · ${missing.length} not found</span></div>
       ${missing.length ? `<p class="chips-label">Not on the shelf</p>
         ${missing.map(i => row(i, i.out ? `<span class="tagx">out</span>` : `<span class="tagx bad">missing</span>`)).join("")}
         <button class="go" style="margin-top:16px" data-act="flagmissing">Flag the ${missing.filter(i => !i.out).length} unaccounted as missing</button>`
-        : `<div class="empty"><b>Everything's there</b>Shelf ${a.shelf} is fully accounted for.</div>`}
+        : `<div class="empty"><b>Everything's there</b>Shelf ${aLabel} is fully accounted for.</div>`}
       <button class="ghost" data-act="auditdone">Finish</button>`;
   }
-  return `<div class="sec-h"><h2>Shelf ${a.shelf}</h2><span>${done} of ${list.length} checked</span></div>
+  return `<div class="sec-h"><h2>Shelf ${aLabel}</h2><span>${done} of ${list.length} checked</span></div>
     <div class="prog"><i style="width:${list.length ? done / list.length * 100 : 0}%"></i></div>
     ${list.map(i => row(i, `<span class="two" style="gap:6px">
       <button class="mini ok" data-mark="${i.id}:yes" ${a.marks[i.id] === "yes" ? 'style="opacity:.5"' : ""}>Here</button>
@@ -1105,24 +1202,65 @@ function auditView(){
     <button class="ghost" data-act="auditdone">Cancel</button>`;
 }
 
+/* items eligible for bulk actions: everything on the chosen shelf (or
+   every item, for the "All items" source), narrowed by the filter box */
+function bulkSourceItems(){
+  const src = S.browse && S.browse[0] === "bulk" ? S.browse[1] : null;
+  if (!src) return [];
+  let list = src === "ALL" ? S.items.slice() : S.items.filter(i => shelfOf(i) === src);
+  const q = S.bq.trim().toLowerCase();
+  if (q) list = list.filter(i => (i.name + " " + (i.contents || "") + " " + (CATS[i.cat] || "") + " " + (i.team || "")).toLowerCase().includes(q));
+  return list;
+}
 function bulkView(){
   const src = S.browse && S.browse[0] === "bulk" ? S.browse[1] : null;
-  const list = src ? S.items.filter(i => shelfOf(i) === src) : [];
-  return `<div class="sec-h"><h2>Bulk move</h2><span>Reshelve a whole group at once</span></div>
-    <p class="chips-label" style="margin-top:0">Move from</p>
-    <div class="chips" style="flex-wrap:wrap">${UNITS.flatMap(u => SHELVES.map(s =>
-      `<button class="chip" data-bulk="${u}-${s}" aria-pressed="${src === u + "-" + s}">${u}-${s} · ${S.items.filter(i => i.unit === u && i.shelf === s).length}</button>`)).join("")}</div>
-    ${!src ? `<div class="empty"><b>Pick the shelf you're clearing</b></div>` : `
-      <p class="chips-label">${S.sel.length} of ${list.length} selected</p>
+  const list = bulkSourceItems();
+  const n = S.sel.length;
+  return `<div class="sec-h"><h2>Bulk edit</h2><span>Reshelve, recategorize, retag or delete a whole group at once</span></div>
+    <p class="chips-label" style="margin-top:0">Start from</p>
+    <div class="chips" style="flex-wrap:wrap">
+      <button class="chip" data-bulk="ALL" aria-pressed="${src === "ALL"}">All items · ${S.items.length}</button>
+      ${UNITS.flatMap(u => SHELVES.map(s =>
+        `<button class="chip" data-bulk="${u}-${s}" aria-pressed="${src === u + "-" + s}">${esc(shelfLabel(u, s))} · ${S.items.filter(i => i.unit === u && i.shelf === s).length}</button>`)).join("")}
+    </div>
+    ${!src ? `<div class="empty"><b>Pick where to start</b>A shelf, or all items — then narrow it down and act on the group at once.</div>` : `
+      <div class="qbox" style="margin:14px 0"><span class="mag">⌕</span>
+        <input id="bq" type="search" value="${esc(S.bq)}" placeholder="Filter this group…" autocomplete="off" autocapitalize="none"></div>
+      <p class="chips-label" style="margin-top:0">${n} of ${list.length} selected</p>
       <div class="two" style="margin-bottom:12px">
         <button class="ghost" style="margin-top:0" data-act="selall">Select all</button>
         <button class="ghost" style="margin-top:0" data-act="selnone">Clear</button>
       </div>
-      ${list.map(i => row(i, `<button class="mini ${S.sel.includes(i.id) ? "ok" : ""}" data-sel="${i.id}">${S.sel.includes(i.id) ? "✓" : "＋"}</button>`)).join("")}
-      <p class="chips-label">Move to</p>
-      <div class="chips" style="flex-wrap:wrap">${UNITS.flatMap(u => SHELVES.map(s =>
-        `<button class="chip" data-dest="${u}-${s}" aria-pressed="${S.dest === u + "-" + s}">${u}-${s}</button>`)).join("")}</div>
-      <button class="go" style="margin-top:16px" data-act="domove">Move ${S.sel.length} item${S.sel.length === 1 ? "" : "s"}${S.dest ? " to " + S.dest : ""}</button>`}`;
+      <div class="listwrap" style="margin-bottom:16px">
+        ${list.length ? list.map(i => row(i, `<button class="mini ${S.sel.includes(i.id) ? "ok" : ""}" data-sel="${i.id}">${S.sel.includes(i.id) ? "✓" : "＋"}</button>`)).join("")
+          : `<div class="empty" style="margin-top:0"><b>Nothing matches</b>Try clearing the filter.</div>`}
+      </div>
+      ${n ? `
+      <div class="panel" style="margin-bottom:14px">
+        <div class="fld"><label>Relocate</label></div>
+        <div class="chips" style="flex-wrap:wrap;margin-top:0">${UNITS.flatMap(u => SHELVES.map(s =>
+          `<button class="chip" data-dest="${u}-${s}" aria-pressed="${S.dest === u + "-" + s}">${esc(shelfLabel(u, s))}</button>`)).join("")}</div>
+        <button class="go" data-act="domove">Move ${n} item${n === 1 ? "" : "s"}${S.dest ? " to " + esc(shelfLabelFromKey(S.dest)) : ""}</button>
+      </div>
+      ${isStaff() ? `
+      <div class="panel" style="margin-bottom:14px">
+        <div class="fld"><label for="bulk-cat">Change category</label>
+          <select id="bulk-cat"><option value="">Choose a category…</option>
+            ${CATS.map((c, i) => CAT_RETIRED[i] ? "" : `<option value="${i}">${esc(c)}</option>`).join("")}</select></div>
+        <button class="go" data-act="bulkcat">Set category for ${n} item${n === 1 ? "" : "s"}</button>
+      </div>
+      <div class="panel" style="margin-bottom:14px">
+        <div class="fld"><label for="bulk-team">Change team</label>
+          <input id="bulk-team" placeholder="Team name, or leave blank to clear"></div>
+        <button class="go" data-act="bulkteam">Set team for ${n} item${n === 1 ? "" : "s"}</button>
+      </div>
+      <div class="panel">
+        <div class="fld"><label>Other</label></div>
+        <div class="two">
+          <button class="ghost" style="margin-top:0" data-act="bulkclearflag">Clear flags</button>
+          <button class="ghost warn" style="margin-top:0" data-act="bulkdelete">Delete ${n}</button>
+        </div>
+      </div>` : ""}` : ""}`}`;
 }
 
 function syncView(){
@@ -1142,13 +1280,93 @@ function syncView(){
     </div>` : ""}`;
 }
 
+/* =======================================================
+   Manage (admin) — rename/add/remove shelving units, resize the
+   shelf count, name one specific shelf, and rename/add/retire
+   categories & issue types. Everything here writes to CONFIG and
+   syncs live to every open tab via saveConfig().
+   ======================================================= */
+function manageView(){
+  const unitInUse = u => S.items.some(i => i.unit === u);
+  const shelfInUse = n => S.items.some(i => +i.shelf === n);
+  return `<div class="sec-h"><h2>Manage</h2><span>Customize shelves, categories &amp; issue types for everyone</span></div>
+
+    <div class="panel" style="margin-bottom:14px">
+      <div class="fld"><label>Shelving units</label>
+        <p class="note" style="margin:0 0 10px">Give a unit a friendlier name — its code (${esc(UNITS.join(", "))}) stays put so nothing on it moves.</p></div>
+      ${UNITS.map(u => `<div class="mgrow">
+          <input id="un-${esc(u)}" value="${esc(UNIT_NAMES[u] || "")}" placeholder="${esc(u)} — no custom name">
+          <button class="mini ok" data-act="saveunit:${esc(u)}">Save</button>
+          <button class="mini no" data-act="removeunit:${esc(u)}" ${unitInUse(u) || UNITS.length <= 1 ? "disabled" : ""}>Remove</button>
+        </div>`).join("")}
+      <div class="mgrow" style="margin-top:6px">
+        <input id="newunit" maxlength="3" placeholder="New unit code, e.g. E" style="text-transform:uppercase">
+        <button class="ghost" style="margin-top:0;width:auto;min-height:40px;padding:0 16px" data-act="addunit">Add unit</button>
+      </div>
+      <p class="note" style="margin-top:10px">Remove is disabled while a unit still has items on it — relocate them first.</p>
+    </div>
+
+    <div class="panel" style="margin-bottom:14px">
+      <div class="fld"><label>Shelves per unit</label>
+        <p class="note" style="margin:0 0 10px">Every unit has the same ${SHELVES.length} numbered shelf slot${SHELVES.length === 1 ? "" : "s"} (1–${SHELVES.length}).</p></div>
+      <div class="two">
+        <button class="ghost" style="margin-top:0" data-act="removeshelf" ${SHELVES.length <= 1 || shelfInUse(SHELVES.length) ? "disabled" : ""}>Remove shelf ${SHELVES.length}</button>
+        <button class="go" style="margin-top:0" data-act="addshelf">Add shelf ${SHELVES.length + 1}</button>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-bottom:14px">
+      <div class="fld"><label>Name a specific shelf</label>
+        <p class="note" style="margin:0 0 10px">Label one shelf, like "Costume Rack" for ${esc(unitLabel(UNITS[0] || "A"))}-3.</p></div>
+      <div class="two">
+        <select id="sn-unit">${UNITS.map(u => `<option value="${esc(u)}">${esc(unitLabel(u))}</option>`).join("")}</select>
+        <select id="sn-num">${SHELVES.map(s => `<option value="${s}">${s}</option>`).join("")}</select>
+      </div>
+      <div class="mgrow" style="margin-top:10px">
+        <input id="sn-name" placeholder="Custom name (blank clears it)">
+        <button class="ghost" style="margin-top:0;width:auto;min-height:40px;padding:0 16px" data-act="saveshelfname">Save</button>
+      </div>
+      ${Object.keys(SHELF_NAMES).length ? `<p class="chips-label">Named shelves</p>
+        <div class="chips" style="flex-wrap:wrap">${Object.entries(SHELF_NAMES).map(([k, name]) =>
+          `<button class="chip" data-act="clearshelfname:${esc(k)}">${esc(name)} (${esc(k)}) ✕</button>`).join("")}</div>` : ""}
+    </div>
+
+    <div class="panel" style="margin-bottom:14px">
+      <div class="fld"><label>Categories</label>
+        <p class="note" style="margin:0 0 10px">Rename a category any time. Retiring one just hides it from the picker for new items — items already filed under it are untouched.</p></div>
+      ${CATS.map((c, i) => `<div class="mgrow">
+          <input id="cn-${i}" value="${esc(c)}" ${CAT_RETIRED[i] ? 'style="opacity:.55"' : ""}>
+          <button class="mini ok" data-act="savecat:${i}">Save</button>
+          <button class="mini ${CAT_RETIRED[i] ? "" : "no"}" data-act="togglecat:${i}">${CAT_RETIRED[i] ? "Unretire" : "Retire"}</button>
+        </div>`).join("")}
+      <div class="mgrow" style="margin-top:6px">
+        <input id="newcat" placeholder="New category name">
+        <button class="ghost" style="margin-top:0;width:auto;min-height:40px;padding:0 16px" data-act="addcat">Add category</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="fld"><label>Issue types</label>
+        <p class="note" style="margin:0 0 10px">The options someone sees when reporting a problem with an item.</p></div>
+      ${FLAGS.map((f, i) => `<div class="mgrow">
+          <input id="fn-${i}" value="${esc(f)}">
+          <button class="mini ok" data-act="saveflag:${i}">Save</button>
+          <button class="mini no" data-act="removeflag:${i}" ${FLAGS.length <= 1 ? "disabled" : ""}>Remove</button>
+        </div>`).join("")}
+      <div class="mgrow" style="margin-top:6px">
+        <input id="newflag" placeholder="New issue type">
+        <button class="ghost" style="margin-top:0;width:auto;min-height:40px;padding:0 16px" data-act="addflag">Add issue type</button>
+      </div>
+    </div>`;
+}
+
 function addView(){
   return `<div class="sec-h"><h2>Add an item</h2><span>It shows up in search right away</span></div>
     <div class="panel">
       <div class="fld"><label for="a-name">Item name</label><input id="a-name" placeholder="Box of fall leaves"></div>
-      <div class="fld"><label for="a-cat">Category</label><select id="a-cat">${CATS.map((c, i) => `<option value="${i}">${esc(c)}</option>`).join("")}</select></div>
+      <div class="fld"><label for="a-cat">Category</label><select id="a-cat">${CATS.map((c, i) => CAT_RETIRED[i] ? "" : `<option value="${i}">${esc(c)}</option>`).join("")}</select></div>
       <div class="fld two">
-        <div><label for="a-unit">Shelving unit</label><select id="a-unit">${UNITS.map(u => `<option>${u}</option>`).join("")}</select></div>
+        <div><label for="a-unit">Shelving unit</label><select id="a-unit">${UNITS.map(u => `<option value="${esc(u)}">${esc(unitLabel(u))}</option>`).join("")}</select></div>
         <div><label for="a-shelf">Shelf</label><select id="a-shelf">${SHELVES.map(s => `<option>${s}</option>`).join("")}</select></div>
       </div>
       <div class="fld"><label for="a-in">What's inside (searchable)</label><input id="a-in" placeholder="ping pong balls, cups, fuzzy balls"></div>
@@ -1167,19 +1385,19 @@ function sheet(){
   if (!it) return "";
   let body = "";
   if (mode === "checkout"){
-    body = `<h3>Check out</h3><p class="sub">${esc(it.name)} · Shelf ${esc(it.unit)}-${esc(it.shelf)}</p>
+    body = `<h3>Check out</h3><p class="sub">${esc(it.name)} · Shelf ${esc(shelfLabel(it.unit, it.shelf))}</p>
       <div class="pend" style="margin-bottom:16px"><b>Back on the shelf tonight</b>
         <small>Your name stays on it until it's back — anyone can check it in for you</small></div>
       <button class="go" data-confirm="${it.id}">Take it — it's on ${esc(S.user.name.split(" ")[0])}</button>
       <button class="ghost" data-act="closesheet">Cancel</button>`;
   } else if (mode === "checkin"){
     const spot = shelfOf(it);
-    body = `<h3>Where did it go?</h3><p class="sub">${esc(it.name)} \u00b7 was on ${esc(spot)}</p>
-      <button class="go" data-inspot="${it.id}:${spot}">Back on ${esc(spot)} \u2014 same spot</button>
+    body = `<h3>Where did it go?</h3><p class="sub">${esc(it.name)} \u00b7 was on ${esc(shelfLabelFromKey(spot))}</p>
+      <button class="go" data-inspot="${it.id}:${spot}">Back on ${esc(shelfLabelFromKey(spot))} \u2014 same spot</button>
       <p class="chips-label">Put it somewhere else?</p>
       <div class="chips" style="flex-wrap:wrap;margin-bottom:6px">
         ${UNITS.flatMap(u => SHELVES.map(s => u + "-" + s)).filter(k => k !== spot)
-          .map(k => `<button class="chip" data-inspot="${it.id}:${k}">${k}</button>`).join("")}</div>
+          .map(k => `<button class="chip" data-inspot="${it.id}:${k}">${esc(shelfLabelFromKey(k))}</button>`).join("")}</div>
       <p class="note">Pick the shelf it's actually on. Everyone sees the new spot.</p>
       <button class="ghost" data-act="closesheet">Cancel</button>`;
   } else if (mode === "report"){
@@ -1197,7 +1415,7 @@ function sheet(){
       <button class="ghost" data-act="closesheet">Cancel</button>`;
   } else if (mode === "history"){
     const log = (it.log || []).slice().reverse();
-    body = `<h3>Who had it</h3><p class="sub">${esc(it.name)} · Shelf ${esc(it.unit)}-${esc(it.shelf)}</p>
+    body = `<h3>Who had it</h3><p class="sub">${esc(it.name)} · Shelf ${esc(shelfLabel(it.unit, it.shelf))}</p>
       ${log.length ? `<div class="hist">${log.map(l => `<div><time>${fmtDate(l.at)}</time>${esc(l.text)}</div>`).join("")}</div>`
         : `<div class="empty" style="margin:0"><b>No trail yet</b>Once people start checking this out, every hand it passes through lands here.</div>`}
       <button class="ghost" data-act="closesheet">Close</button>`;
@@ -1206,7 +1424,7 @@ function sheet(){
       <div class="fld"><label>Item name</label><input id="e-name" value="${esc(it.name)}"></div>
       <div class="fld"><label>Category</label><select id="e-cat">${CATS.map((c, i) => `<option value="${i}" ${i === it.cat ? "selected" : ""}>${esc(c)}</option>`).join("")}</select></div>
       <div class="fld two">
-        <div><label>Unit</label><select id="e-unit">${UNITS.map(u => `<option ${it.unit === u ? "selected" : ""}>${u}</option>`).join("")}</select></div>
+        <div><label>Unit</label><select id="e-unit">${UNITS.map(u => `<option value="${esc(u)}" ${it.unit === u ? "selected" : ""}>${esc(unitLabel(u))}</option>`).join("")}</select></div>
         <div><label>Shelf</label><select id="e-shelf">${SHELVES.map(s => `<option ${+it.shelf === s ? "selected" : ""}>${s}</option>`).join("")}</select></div>
       </div>
       <div class="fld"><label>What's inside (searchable)</label><input id="e-in" value="${esc(it.contents || "")}" placeholder="ping pong balls, cups"></div>
@@ -1301,10 +1519,38 @@ function addItem(){
 function doMove(){
   if (!S.sel.length) return toast("Pick some items first");
   if (!S.dest) return toast("Pick where they're going");
-  const [u, s] = S.dest.split("-");
-  S.sel.forEach(id => { const it = byId(id); if (it){ it.unit = u; it.shelf = +s; logIt(it, "Moved to " + S.dest + " by " + S.user.name); } });
+  const [u, s] = S.dest.split("-"), label = shelfLabelFromKey(S.dest);
+  S.sel.forEach(id => { const it = byId(id); if (it){ it.unit = u; it.shelf = +s; logIt(it, "Moved to " + label + " by " + S.user.name); } });
   const n = S.sel.length;
-  S.sel = []; save(); render(); toast(n + " item" + (n === 1 ? "" : "s") + " now on " + S.dest);
+  S.sel = []; S.dest = null; save(); render(); toast(n + " item" + (n === 1 ? "" : "s") + " now on " + label);
+}
+function bulkDelete(){
+  if (!S.sel.length) return toast("Pick some items first");
+  const n = S.sel.length;
+  if (!confirm("Delete " + n + " item" + (n === 1 ? "" : "s") + " from the inventory? This can't be undone.")) return;
+  S.items = S.items.filter(x => !S.sel.includes(x.id));
+  S.sel = []; save(); render(); toast("Deleted " + n + " item" + (n === 1 ? "" : "s"));
+}
+function bulkClearFlag(){
+  if (!S.sel.length) return toast("Pick some items first");
+  let n = 0;
+  S.sel.forEach(id => { const it = byId(id); if (it && it.flag){ it.flag = null; logIt(it, "Issue resolved by " + S.user.name); n++; } });
+  save(); render(); toast(n ? "Cleared " + n + " flag" + (n === 1 ? "" : "s") : "Nothing in the selection was flagged");
+}
+function bulkSetCat(){
+  if (!S.sel.length) return toast("Pick some items first");
+  const sel = $("#bulk-cat"), i = sel ? +sel.value : NaN;
+  if (!sel || sel.value === "" || isNaN(i)) return toast("Pick a category first");
+  const n = S.sel.length;
+  S.sel.forEach(id => { const it = byId(id); if (it){ it.cat = i; logIt(it, "Recategorized to " + CATS[i] + " by " + S.user.name); } });
+  save(); render(); toast("Set category for " + n + " item" + (n === 1 ? "" : "s"));
+}
+function bulkSetTeam(){
+  if (!S.sel.length) return toast("Pick some items first");
+  const val = ($("#bulk-team") && $("#bulk-team").value.trim()) || "";
+  const n = S.sel.length;
+  S.sel.forEach(id => { const it = byId(id); if (it){ it.team = val; logIt(it, "Team set to " + (val || "(none)") + " by " + S.user.name); } });
+  save(); render(); toast("Set team for " + n + " item" + (n === 1 ? "" : "s"));
 }
 function flagMissing(){
   const a = S.audit; if (!a) return;
@@ -1315,6 +1561,87 @@ function flagMissing(){
   });
   S.audit = null; S.page = "issues"; save(); render(); toast(gone.length + " flagged as missing");
 }
+
+/* =======================================================
+   Admin: manage config (units, shelves, categories, flags)
+   ======================================================= */
+function renameUnit(u){
+  const el = $("#un-" + u); if (!el) return;
+  const name = el.value.trim();
+  if (name) UNIT_NAMES[u] = name; else delete UNIT_NAMES[u];
+  saveConfig(); render(); toast(name ? "Renamed Shelf " + u + " to " + name : "Cleared the custom name");
+}
+function addUnit(){
+  const el = $("#newunit"); const code = (el.value || "").trim().toUpperCase();
+  if (!code) return toast("Give the new unit a code");
+  if (UNITS.includes(code)) return toast("That code is already in use");
+  UNITS.push(code);
+  saveConfig(); render(); toast("Added Shelf " + code);
+}
+function removeUnit(u){
+  if (S.items.some(i => i.unit === u)) return toast("Relocate everything off it first");
+  if (UNITS.length <= 1) return toast("Keep at least one shelving unit");
+  if (!confirm('Remove shelving unit "' + unitLabel(u) + '"?')) return;
+  UNITS = UNITS.filter(x => x !== u);
+  delete UNIT_NAMES[u];
+  Object.keys(SHELF_NAMES).forEach(k => { if (k.startsWith(u + "-")) delete SHELF_NAMES[k]; });
+  saveConfig(); render(); toast("Removed unit " + u);
+}
+function addShelf(){
+  SHELF_COUNT++; SHELVES = buildShelves();
+  saveConfig(); render(); toast("Added shelf " + SHELF_COUNT + " to every unit");
+}
+function removeShelf(){
+  const n = SHELVES.length;
+  if (n <= 1) return toast("Keep at least one shelf");
+  if (S.items.some(i => +i.shelf === n)) return toast("Relocate what's on shelf " + n + " first");
+  if (!confirm("Remove shelf " + n + " from every unit?")) return;
+  SHELF_COUNT = n - 1; SHELVES = buildShelves();
+  Object.keys(SHELF_NAMES).forEach(k => { if (k.endsWith("-" + n)) delete SHELF_NAMES[k]; });
+  saveConfig(); render(); toast("Removed shelf " + n);
+}
+function saveShelfName(){
+  const u = $("#sn-unit").value, s = $("#sn-num").value, name = $("#sn-name").value.trim();
+  const key = shelfKey(u, s);
+  if (name) SHELF_NAMES[key] = name; else delete SHELF_NAMES[key];
+  saveConfig(); render(); toast(name ? "Named " + shelfLabel(u, +s) : "Cleared the name");
+}
+function clearShelfName(key){
+  delete SHELF_NAMES[key]; saveConfig(); render(); toast("Cleared the name");
+}
+function renameCat(i){
+  const el = $("#cn-" + i); if (!el) return;
+  const name = el.value.trim();
+  if (name.length < 2) return toast("Give the category a name");
+  CATS[i] = name; saveConfig(); render(); toast("Renamed");
+}
+function toggleCat(i){
+  CAT_RETIRED[i] = !CAT_RETIRED[i]; saveConfig(); render();
+  toast(CAT_RETIRED[i] ? "Retired — hidden for new items" : "Unretired");
+}
+function addCat(){
+  const el = $("#newcat"); const name = (el.value || "").trim();
+  if (name.length < 2) return toast("Give the category a name");
+  CATS.push(name); CAT_RETIRED.push(false);
+  saveConfig(); render(); toast("Added " + name);
+}
+function renameFlag(i){
+  const el = $("#fn-" + i); if (!el) return;
+  const name = el.value.trim();
+  if (name.length < 2) return toast("Give it a name");
+  FLAGS[i] = name; saveConfig(); render(); toast("Renamed");
+}
+function removeFlag(i){
+  if (FLAGS.length <= 1) return toast("Keep at least one issue type");
+  if (!confirm('Remove issue type "' + FLAGS[i] + '"?')) return;
+  FLAGS.splice(i, 1); saveConfig(); render(); toast("Removed");
+}
+function addFlag(){
+  const el = $("#newflag"); const name = (el.value || "").trim();
+  if (name.length < 2) return toast("Give it a name");
+  FLAGS.push(name); saveConfig(); render(); toast("Added " + name);
+}
+
 function exportCSV(){
   const head = ["ID","Item name","Category","Shelving unit","Shelf","Team","Inside","Notes","Status","Out with","Since","Flag"];
   const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
@@ -1367,7 +1694,9 @@ function render(){
   const r = $("#root");
   if (!S.user){ r.innerHTML = loginView(); return; }
   const view = { search: searchView, away: awayView, out: outView,
-    more: moreView, audit: auditView, bulk: bulkView, sync: syncView, add: addView, issues: issuesView, list: listView }[S.page] || searchView;
+    more: moreView, audit: auditView, bulk: bulkView, sync: syncView, add: addView, issues: issuesView, list: listView,
+    manage: manageView }[S.page] || searchView;
+  if (S.page === "manage" && !isStaff()){ S.page = "more"; return render(); }
   r.innerHTML = bar() + `<main>${view()}</main>` + nav() + sheet();
   const q = $("#q");
   if (q && S.q){ q.focus(); q.setSelectionRange(q.value.length, q.value.length); }
@@ -1380,21 +1709,21 @@ document.addEventListener("click", e => {
   if (d.act === "signin") return signIn();
   if (d.act === "signout") return signOut();
   if (d.act === "closesheet"){ S.sheet = null; S.pick = null; return render(); }
-  if (d.page){ S.page = d.page; if (d.page === "search") S.q = ""; if (d.page === "bulk"){ S.sel = []; S.browse = null; S.dest = null; } render(); window.scrollTo(0, 0); return; }
+  if (d.page){ S.page = d.page; if (d.page === "search") S.q = ""; if (d.page === "bulk"){ S.sel = []; S.browse = null; S.dest = null; S.bq = ""; } render(); window.scrollTo(0, 0); return; }
   if (d.browse){ const [k, v] = d.browse.split(":"); S.browse = (S.browse && S.browse[0] === k && String(S.browse[1]) === v) ? null : [k, v]; return render(); }
   if (d.sheet){ S.sheet = d.sheet.split(":"); S.pick = null; return render(); }
   if (t.hasAttribute("data-pick")){ S.pick = d.pick; return render(); }
   if (d.confirm) return checkOut(d.confirm);
   if (d.in) return checkIn(d.in);
   if (d.inspot){ const [id, spot] = d.inspot.split(":"); return checkIn(id, false, spot); }
-  if (d.inshelf) return returnAll(S.items.filter(i => i.out && shelfOf(i) === d.inshelf && (isStaff() || i.out.by === S.user.name)), "Shelf " + d.inshelf);
+  if (d.inshelf) return returnAll(S.items.filter(i => i.out && shelfOf(i) === d.inshelf && (isStaff() || i.out.by === S.user.name)), "Shelf " + shelfLabelFromKey(d.inshelf));
   if (d.flag) return sendFlag(d.flag);
   if (d.clear) return clearFlag(d.clear);
   if (d.save) return saveEdit(d.save);
   if (d.del) return delItem(d.del);
   if (d.audit){ S.audit = { shelf: d.audit, marks: {}, finished: false }; return render(); }
   if (d.mark){ const [id, v] = d.mark.split(":"); S.audit.marks[id] = v; return render(); }
-  if (d.bulk){ S.browse = ["bulk", d.bulk]; S.sel = []; return render(); }
+  if (d.bulk){ S.browse = ["bulk", d.bulk]; S.sel = []; S.dest = null; S.bq = ""; return render(); }
   if (d.sel){ S.sel = S.sel.includes(d.sel) ? S.sel.filter(x => x !== d.sel) : S.sel.concat(d.sel); return render(); }
   if (d.dest){ S.dest = d.dest; return render(); }
   if (d.lf){ S.lf = d.lf; return render(); }
@@ -1402,6 +1731,18 @@ document.addEventListener("click", e => {
   if (d.mark2){ const [id, v] = d.mark2.split(":");
     if (S.check[id] === v) delete S.check[id]; else S.check[id] = v;
     return render(); }
+  if (d.act && d.act.includes(":") && isStaff()){
+    const i = d.act.indexOf(":"), act = d.act.slice(0, i), arg = d.act.slice(i + 1);
+    switch (act){
+      case "saveunit": return renameUnit(arg);
+      case "removeunit": return removeUnit(arg);
+      case "clearshelfname": return clearShelfName(arg);
+      case "savecat": return renameCat(+arg);
+      case "togglecat": return toggleCat(+arg);
+      case "saveflag": return renameFlag(+arg);
+      case "removeflag": return removeFlag(+arg);
+    }
+  }
   switch (d.act){
     case "add": return addItem();
     case "export": return exportCSV();
@@ -1409,17 +1750,28 @@ document.addEventListener("click", e => {
     case "auditfinish": S.audit.finished = true; return render();
     case "auditdone": S.audit = null; return render();
     case "flagmissing": return flagMissing();
-    case "selall": { const src = S.browse && S.browse[1]; S.sel = S.items.filter(i => shelfOf(i) === src).map(i => i.id); return render(); }
+    case "selall": S.sel = bulkSourceItems().map(i => i.id); return render();
     case "selnone": S.sel = []; return render();
     case "domove": return doMove();
+    case "bulkdelete": return bulkDelete();
+    case "bulkclearflag": return bulkClearFlag();
+    case "bulkcat": return bulkSetCat();
+    case "bulkteam": return bulkSetTeam();
     case "checkstart": S.check = {}; S.lf = "all"; return render();
     case "checkstop": S.check = null; S.lf = "all"; return render();
     case "checkfinish": return finishCheck();
+    case "addunit": if (isStaff()) return addUnit(); break;
+    case "addshelf": if (isStaff()) return addShelf(); break;
+    case "removeshelf": if (isStaff()) return removeShelf(); break;
+    case "saveshelfname": if (isStaff()) return saveShelfName(); break;
+    case "addcat": if (isStaff()) return addCat(); break;
+    case "addflag": if (isStaff()) return addFlag(); break;
   }
 });
 document.addEventListener("input", e => {
   if (e.target.id === "q"){ S.q = e.target.value; S.browse = null; render(); }
   if (e.target.id === "lq"){ S.lq = e.target.value; render(); const el = $("#lq"); if (el){ el.focus(); el.setSelectionRange(el.value.length, el.value.length); } }
+  if (e.target.id === "bq"){ S.bq = e.target.value; render(); const el = $("#bq"); if (el){ el.focus(); el.setSelectionRange(el.value.length, el.value.length); } }
 });
 document.addEventListener("keydown", e => {
   if (e.key === "Escape" && S.sheet){ S.sheet = null; S.pick = null; render(); }
@@ -1428,7 +1780,7 @@ document.addEventListener("keydown", e => {
 
 (async function boot(){
   render(); // show something immediately while Supabase loads
-  const [items] = await Promise.all([loadItems(), loadRoster()]);
+  const [items] = await Promise.all([loadItems(), loadRoster(), loadConfig()]);
   S.items = items.length ? items : buildSeed();
   if (!items.length) save(); // empty database (e.g. seed SQL not run yet) — push the built-in seed
   const sraw = sessionStore.get(SKEY);
